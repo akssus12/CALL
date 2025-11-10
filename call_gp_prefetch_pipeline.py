@@ -18,14 +18,14 @@ import pathlib, random, torch, threading
 import subprocess
 
 # ======================
-# Global knobs (새로 추가/노출)
+# Global knobs
 # ======================
-DEFAULT_PREFETCH_WAIT_BUDGET = 0.010  # 10ms: 쿼리 시작 시 프리페치 '선택적 대기' 상한
-DEFAULT_PREFETCH_POOL_WORKERS = 8     # 프리페치 동시성 상한 (과도한 I/O 방지)
-DEFAULT_WARM_FRACTION = 0.25          # 부분 프리페치(head 비율), 나머지는 백그라운드 보강
-DEFAULT_LASTN_TO_TRIGGER = 2          # 라스트-2 시점에서 다음 그룹 프리페치 시작
+DEFAULT_PREFETCH_WAIT_BUDGET = 0.1  # 선택적 대기 상한(초) 예: 10ms
+DEFAULT_PREFETCH_POOL_WORKERS = 8     # 프리페치 동시성 상한
+DEFAULT_WARM_FRACTION = 0.25          # head-first 부분 프리페치 비율
+DEFAULT_LASTN_TO_TRIGGER = 1          # 라스트-N 트리거
 
-# Global variables (기존 유지)
+# Global variables
 minibatch_model = None
 buffered_queries = []
 buffered_vectors = []
@@ -43,10 +43,8 @@ class ClusterCache:
         self.max_size = max_size
 
     def _calculate_eviction_priority(self, cluster_id):
-        # 낮을수록 우선 퇴출: latency * count
         return self.cache[cluster_id]["latency"] * self.cache[cluster_id]["count"]
 
-    # 프리페치 경로: OS drop_caches 없이 메모리만 비움(프리페치 이득 보존)
     def evict_if_needed_prefetch(self, new_cluster_count):
         current_size = len(self.cache)
         if current_size + new_cluster_count > self.max_size:
@@ -56,7 +54,6 @@ class ClusterCache:
                 del self.cache[cluster_id]
             threading.Thread(target=gc.collect, daemon=True).start()
 
-    # 일반 경로: drop_caches 호출 유지(필요 시). 하지만 I/O 이득 손실 우려 → 필요 없으면 drop_caches() 주석
     def evict_if_needed(self, new_cluster_count):
         current_size = len(self.cache)
         if current_size + new_cluster_count > self.max_size:
@@ -65,7 +62,7 @@ class ClusterCache:
             for cluster_id in eviction_candidates:
                 del self.cache[cluster_id]
             threading.Thread(target=gc.collect, daemon=True).start()
-            # drop_caches()  # 프리페치 효율에 악영향이면 비활성화 권장
+            # drop_caches()  # 필요 없다면 비활성(프리페치 이점 보존)
 
     def get(self, cluster_id):
         if cluster_id in self.cache:
@@ -102,8 +99,8 @@ class EdgeRAGWithCache:
         self.result_path = result_path
 
         self.cache = ClusterCache(max_size=cache_size)
-        self.cluster_generation_latency = {}   # 미리 측정된 클러스터 로딩시간
-        self.cluster_file_size_mb = {}         # 파일 크기 메타
+        self.cluster_generation_latency = {}
+        self.cluster_file_size_mb = {}
 
         self.total_cluster_requests = 0
         self.total_cache_hits = 0
@@ -111,17 +108,14 @@ class EdgeRAGWithCache:
         self.query_cnt = 1
 
         self.batch_id = 1
-        self.warmupCnt = 1  # 1~20: 워밍업
+        self.warmupCnt = 1
 
-        self.query_buffer = []
-
-        # ===== 새로 추가된 프리페치 관리 =====
+        # Prefetch state
         self.prefetch_pool = ThreadPoolExecutor(max_workers=prefetch_pool_workers)
-        self.prefetch_futures = {}  # {cluster_id: Future}
+        self.prefetch_futures = {}  # {cid: Future}
         self.prefetch_wait_budget = prefetch_wait_budget
         self.warm_fraction = warm_fraction
 
-        # CSV 헤더
         with open(self.result_path, mode='w', newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -134,64 +128,59 @@ class EdgeRAGWithCache:
             writer = csv.writer(f)
             writer.writerow([seq, bs, tt, ebt, flt, clt, slt, nmc, evt, put, vst, chr, qg, num, drs, prefetch])
 
-    # ========= 프리페치 제출(클러스터 단위 Future로 관리) =========
     def _submit_prefetch_if_needed(self, cid):
+        cid = int(cid)
         if cid in self.cache.cache:
             return
         if cid in self.prefetch_futures:
             return
-        # 부분 프리페치(head) + tail 백그라운드 보강
+        # load_and_cache_cluster, cluster_id, self.cluster_embedding_path, self.cluster_generation_latency, self.cache)
         self.prefetch_futures[cid] = self.prefetch_pool.submit(
-            load_and_cache_cluster_mmap,
-            int(cid), self.cluster_embedding_path, self.cluster_generation_latency, self.cache,
-            32, 512, 2048, True, self.warm_fraction
+            load_and_cache_cluster,
+            cid, self.cluster_embedding_path, self.cluster_generation_latency, self.cache
         )
 
     def prefetch_cluster(self, next_query, next_cluster_ids):
-        # 메모리 선제 확보 (drop_caches 없음)
         self.cache.evict_if_needed_prefetch(len(next_cluster_ids))
         for cid in next_cluster_ids:
             try:
                 self._submit_prefetch_if_needed(cid)
             except Exception as e:
                 print(f"[Prefetch Error] Cluster {cid} failed: {e}")
-        # 비동기 제출만 하고 반환 (대기는 search()에서 타임박스)
         print(f"[Prefetch Submit] ({next_query}) -> {list(next_cluster_ids)}")
 
     def _profile_cluster_generation(self):
-        # 사전 로딩 비용/크기 측정 (예: 0~99)
         for cluster_id in range(0, 100):
             try:
                 start_time = time.time()
                 cluster = f"cluster_{cluster_id}.npy"
                 fp = self.cluster_embedding_path.joinpath(cluster)
                 file_size = os.path.getsize(fp) / (1024.0 * 1024.0)
-                # 실제 로딩 없이 메타만 수집하려면 np.load 생략 가능
                 np.load(fp)
                 self.cluster_file_size_mb[cluster_id] = file_size
                 np.load(fp)
                 self.cluster_generation_latency[cluster_id] = time.time() - start_time
             except Exception:
-                # 누락된 샘플은 넘어감
                 pass
         print("[Precompute] Cluster generation latencies computed successfully.")
 
-    def search(self, query_text, model, sorted_duration, k, total_messages, dynamic_thread, prefetched_dict, num_thread):
-        # ===== 1) 쿼리 인코딩 =====
+    def search(self, query_text, model, sorted_duration, k, total_messages, dynamic_thread,
+               prefetched_dict, num_thread, prefetch_granuality):
+        # 1) encode
         encodeing_start_time_at_search = time.time()
         query_vector = model.encode([query_text])
         encodeing_end_time_at_search = time.time() - encodeing_start_time_at_search
 
-        # ===== 2) coarse lookup =====
+        # 2) coarse lookup
         firstlookup_start_time_at_search = time.time()
         _, cluster_ids = self.coarse_quantizer.search(query_vector, k)
         firstlookup_end_time_at_search = time.time() - firstlookup_start_time_at_search
-        cluster_ids = cluster_ids[0]  # np.int64 → int 변환 용이
+        cluster_ids = cluster_ids[0]
 
         self.query_cnt += 1
         self.total_cluster_requests += len(cluster_ids)
 
-        # ===== 3) 선택적 대기(타임박스) - 이번 쿼리에 필요한 cid만 wait =====
+        # 3) 선택적 대기(타임박스)
         prefetch_waiting_start_time = time.time()
         waiting_targets = [int(cid) for cid in cluster_ids
                            if (int(cid) in self.prefetch_futures) and (self.cache.get(int(cid)) is None)]
@@ -206,18 +195,17 @@ class EdgeRAGWithCache:
             try:
                 fut.result(timeout=max(0.0, remain))
             except concurrent.futures.TimeoutError:
-                pass  # 타임아웃이면 즉시 진행
+                pass
             except Exception as e:
                 print(f"[Prefetch Future Error] cid={cid}, {e}")
         prefetch_waiting_end_time = time.time() - prefetch_waiting_start_time
 
-        # ===== 4) 캐시 조회 / 미싱 수집 =====
+        # 4) 캐시 조회 / 미싱 수집
         cachelookup_start_time_at_search = time.time()
         temp_embeddings = []
         missing_clusters = []
         cache_hits = 0
         cache_miss = 0
-
         for cid in cluster_ids:
             emb = self.cache.get(int(cid))
             if emb is not None:
@@ -229,7 +217,7 @@ class EdgeRAGWithCache:
         cachelookup_end_time_at_search = time.time() - cachelookup_start_time_at_search
         self.total_cache_hits += cache_hits
 
-        # ===== 5) 미싱 로딩 (동시성 조절) =====
+        # 5) 미싱 로딩
         secondlookup_start_time_at_search = time.time()
         lookup_file_size = 0
         evict_time = 0.0
@@ -240,19 +228,16 @@ class EdgeRAGWithCache:
             self.cache.evict_if_needed(len(missing_clusters))
             evict_time = time.time() - evict_start_time
 
-            # dynamic_thread: ours(동적) vs fixed(=1)
             num_workers = os.cpu_count() // 2 if dynamic_thread == "dynamic" else 1
-            # 간단 배치 스케줄링
             thread_assignments = optimized_clusters_placement(missing_clusters, self.cluster_file_size_mb, num_workers)
 
             put_start_time = time.time()
             with ThreadPoolExecutor(max_workers=max(1, num_workers)) as executor:
                 futures = {
                     executor.submit(
-                        load_and_cache_cluster_mmap,
+                        load_and_cache_cluster,
                         cid, self.cluster_embedding_path,
-                        self.cluster_generation_latency, self.cache,
-                        1, 512, 2048, True, self.warm_fraction
+                        self.cluster_generation_latency, self.cache
                     ): cid for cid in thread_assignments
                 }
                 for fut, cid in futures.items():
@@ -269,21 +254,19 @@ class EdgeRAGWithCache:
         secondlookup_end_time_at_search = time.time() - secondlookup_start_time_at_search
         refined_lookup_file_size = int(lookup_file_size / (1024.0 * 1024.0))
 
-        # ===== 6) 벡터 검색 (병렬 클러스터 병합 검색) =====
+        # 6) 벡터 검색
         vectorsearch_start_time_at_search = time.time()
         I, D = parallel_faiss_search(query_vector, temp_embeddings, k)
         vectorsearch_end_time_at_search = time.time() - vectorsearch_start_time_at_search
         total_duration = time.time() - prefetch_waiting_start_time
 
-        # ===== 7) 프리페치 트리거 (라스트-2) =====
+        # 7) 프리페치 트리거 (라스트-N)
         keys = list(sorted(prefetched_dict.keys()))
         boolean_prefetching = 0
         prefetching_start_time_at_search = time.time()
 
-        # prefetched_dict[group_id] = {"FQ":..., "FQSET":..., "LQ":..., "LQSET":..., "LAST_N": set(...)}
         for gid, meta in prefetched_dict.items():
             if query_text in meta["LAST_N"]:
-                # 다음 그룹
                 idx = keys.index(gid)
                 if idx + 1 < len(keys):
                     nxt_gid = keys[idx + 1]
@@ -291,12 +274,33 @@ class EdgeRAGWithCache:
                     next_first_clusters = prefetched_dict[nxt_gid]["FQSET"]
 
                     boolean_prefetching = 1
-                    # 제출만 하고 반환 (search 앞단에서 타임박스 대기)
-                    self.prefetch_cluster(next_first_query, next_first_clusters)
+                    # === granularity 분기 ===
+                    if prefetch_granuality == "fg":
+                        # FQ 전용 프리페치
+                        self.prefetch_cluster(next_first_query, next_first_clusters)
+
+                    elif prefetch_granuality == "balance":
+                        # 다음 그룹 전체 쿼리의 클러스터 빈도를 집계, 상위(캐시 여유 슬롯)만 프리페치
+                        q2c = prefetched_dict[nxt_gid].get("Q2C", {})
+                        freq = defaultdict(int)
+                        for _q, cset in q2c.items():
+                            for cid in cset:
+                                cid = int(cid)
+                                if (self.cache.get(cid) is None) and (cid not in self.prefetch_futures):
+                                    freq[cid] += 1
+                        if freq:
+                            free_slots = max(0, self.cache.max_size - len(self.cache.cache))
+                            targets = [cid for cid, _ in sorted(freq.items(), key=lambda x: x[1], reverse=True)]
+                            if free_slots > 0:
+                                targets = targets[:free_slots]
+                            if targets:
+                                self.prefetch_cluster(next_first_query, targets)
+                    # === granularity 분기 끝 ===
                 break
+
         prefetching_async_end_time_at_search = time.time() - prefetching_start_time_at_search
 
-        # ===== 8) 로깅 =====
+        # 8) 로깅
         total_cache_num = cache_hits + cache_miss
         cache_hit_ratio = (cache_hits / total_cache_num) if total_cache_num > 0 else 0.0
 
@@ -345,13 +349,11 @@ def chunks(lst, n):
 
 
 def batched_encode_and_cluster(batch, model, edgeRagSearcher, k):
-    start_batched_encode_cluster_time = time.time()
     vectors = model.encode(batch, convert_to_numpy=True)
     results = []
     for query_text, vector in zip(batch, vectors):
         _, cluster_ids = edgeRagSearcher.coarse_quantizer.search(vector.reshape(1, -1), k)
         results.append((query_text, vector, frozenset(cluster_ids[0])))
-    _ = time.time() - start_batched_encode_cluster_time
     return results
 
 
@@ -360,12 +362,10 @@ def sort_queries_by_clustering(edgeRagSearcher, messages, model, float_value, k,
     batched_inputs = list(chunks(messages, max(1, len(messages) // 10 + 1)))
     num_workers = max(1, len(batched_inputs))
 
-    start_batched_encode_cluster_time = time.time()
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = list(executor.map(lambda b: batched_encode_and_cluster(b, model, edgeRagSearcher, k), batched_inputs))
     for batch_result in futures:
         all_results.extend(batch_result)
-    end_batched_encode_cluster_time = time.time() - start_batched_encode_cluster_time
 
     query_texts, query_vectors, cluster_sets = [], [], []
     cluster_id_mapping = {}
@@ -379,7 +379,6 @@ def sort_queries_by_clustering(edgeRagSearcher, messages, model, float_value, k,
     num_queries = len(query_texts)
     jaccard_matrix = np.zeros((num_queries, num_queries))
 
-    start_compute_jaccard_similarity_time = time.time()
     if jaccard_calculation == "vector":
         all_cluster_ids = set().union(*cluster_sets) if cluster_sets else set()
         cluster_id_list = sorted(list(all_cluster_ids))
@@ -402,7 +401,6 @@ def sort_queries_by_clustering(edgeRagSearcher, messages, model, float_value, k,
                 if i != j:
                     jaccard_matrix[i, j] = compute_jaccard_similarity(cluster_sets[i], cluster_sets[j])
         jaccard_distance_matrix = 1 - jaccard_matrix
-    end_compute_jaccard_similarity_time = time.time() - start_compute_jaccard_similarity_time
 
     optimal_distance_threshold = 1.0 - float_value
     clustering = AgglomerativeClustering(
@@ -411,34 +409,37 @@ def sort_queries_by_clustering(edgeRagSearcher, messages, model, float_value, k,
     )
     cluster_labels = clustering.fit_predict(jaccard_distance_matrix)
 
-    # 그룹별 쿼리 묶기
+    # 그룹별 묶기
     cluster_groups = defaultdict(list)
     for query, assigned_cluster_id in zip(query_texts, cluster_labels):
         cluster_groups[assigned_cluster_id].append((query, cluster_id_mapping[query]))
 
-    # 라스트-2 프리페치를 위한 메타 구성
+    # prefetched_dict 구성 (Q2C 포함)
     prefetched_dict = {}
-    for key, value in cluster_groups.items():
-        # value: [(query, set_of_faiss_cluster_ids), ...]
-        queries = [q for q, _ in value]
+    keys_sorted = sorted(cluster_groups.keys())
+    for key in keys_sorted:
+        value = cluster_groups[key]  # [(query, set_of_ids), ...] (그룹 내부 순서는 그대로)
+        queries = [q for (q, _) in value]
         last_n = set(queries[max(0, len(queries) - DEFAULT_LASTN_TO_TRIGGER):])
+        # Q2C: 쿼리→클러스터 집합
+        q2c = {q: set(cset) for (q, cset) in value}
         prefetched_dict[key] = {
             "FQ": value[0][0],
             "FQSET": value[0][1],
             "LQ": value[-1][0],
             "LQSET": value[-1][1],
             "LAST_N": last_n,
+            "Q2C": q2c,
         }
 
-    # 정렬된 쿼리 반환
     sorted_queries = sorted(zip(cluster_labels, query_texts, query_vectors), key=lambda x: x[0])
     return [(q, v) for _, q, v in sorted_queries], prefetched_dict
 
 
 def kafka_search(topic_name, centroid_path, cluster_embedding_path, result_path,
                  float_value, nlist_s, cache_size_s, linkage_value,
-                 dynamic_thread, jaccard_calculation, num_thread):
-    # ===== 트래픽 설정 (Weibull burst) =====
+                 dynamic_thread, jaccard_calculation, num_thread, prefetch_granuality):
+    # 트래픽 설정
     avg_normal = 100
     time_interval = 1.0
     burst_duration = 5
@@ -453,7 +454,7 @@ def kafka_search(topic_name, centroid_path, cluster_embedding_path, result_path,
     weibull_norm = weibull_raw / max(weibull_raw)
     burst_pattern = [int(avg_normal * (1 + (peak_scale - 1) * w)) for w in weibull_norm]
 
-    # ===== 모델/서처 =====
+    # 모델/서처
     model = SentenceTransformer("all-MiniLM-L6-v2")
     edgeRagSearcher = EdgeRAGWithCache(
         centroid_path, cache_size_s, cluster_embedding_path, result_path,
@@ -463,7 +464,7 @@ def kafka_search(topic_name, centroid_path, cluster_embedding_path, result_path,
     )
     edgeRagSearcher._profile_cluster_generation()
 
-    # ===== Kafka Consumer =====
+    # Kafka consumer
     consumer = KafkaConsumer(
         topic_name,
         bootstrap_servers="163.239.199.205:9092",
@@ -517,7 +518,8 @@ def kafka_search(topic_name, centroid_path, cluster_embedding_path, result_path,
                 for query_text, query_vector in sorted_queries:
                     edgeRagSearcher.search(
                         query_text, model, sorted_duration, nlist_s,
-                        total_messages, dynamic_thread, prefetched_dict, num_thread
+                        total_messages, dynamic_thread, prefetched_dict,
+                        num_thread, prefetch_granuality=prefetch_granuality
                     )
 
                 total_messages.clear()
@@ -554,7 +556,6 @@ def parallel_faiss_search(query_vector, embeddings_list, k):
         print("Non results")
         return [np.array([], dtype=np.int64)], [np.array([], dtype=np.float32)]
 
-    # 각 결과는 (D, I) 형태. 여기서는 동일 쿼리 1개 기준
     merged_D = np.hstack([r[0] for r in results])
     merged_I = np.hstack([r[1] for r in results])
     topk_idx = np.argsort(merged_D[0])[:k]
@@ -562,7 +563,7 @@ def parallel_faiss_search(query_vector, embeddings_list, k):
 
 
 # ======================
-# Load & Cache (기본/부분 프리페치 버전)
+# Load & Cache
 # ======================
 def load_and_cache_cluster(cluster_id, cluster_embedding_path, cluster_generation_latency, cache):
     try:
@@ -588,10 +589,6 @@ def drop_caches():
 def load_and_cache_cluster_mmap(cluster_id, cluster_embedding_path, cluster_generation_latency, cache,
                                 max_threads=10, min_shard_size=512, max_shard_size=2048,
                                 warm_shards_first=True, warm_fraction=DEFAULT_WARM_FRACTION):
-    """
-    mmap + 병렬 디코딩 + 부분 프리페치(head 먼저), tail은 백그라운드 보강
-    반환: (현재 캐시에 넣은 embeddings, 파일 바이트 수)
-    """
     try:
         filename = cluster_embedding_path.joinpath(f"cluster_{cluster_id}.npy")
         lookup_file_size = os.path.getsize(filename)
@@ -600,26 +597,20 @@ def load_and_cache_cluster_mmap(cluster_id, cluster_embedding_path, cluster_gene
         if total_vectors == 0:
             return None
 
-        # 1) 먼저 head 비율만 동기 로딩
         first_count = total_vectors if not warm_shards_first else max(1, int(total_vectors * warm_fraction))
         head = mmap_array[:first_count].copy()
 
-        # 2) 캐시에 head 등록
         latency = cluster_generation_latency.get(cluster_id, float("inf"))
         cache.put(cluster_id, head, latency)
 
-        # 3) tail은 백그라운드에서 이어붙이기
         if warm_shards_first and first_count < total_vectors:
             def fill_rest():
                 try:
-                    # 병렬 샤딩 디코드
                     remain = total_vectors - first_count
-                    # shard size/threads 계산
                     def shard_copy(i):
                         s = first_count + i * min_shard_size
                         e = min(first_count + (i + 1) * min_shard_size, total_vectors)
                         return mmap_array[s:e].copy()
-
                     num_shards = math.ceil(remain / min_shard_size)
                     tails = []
                     with ThreadPoolExecutor(max_workers=min(max_threads, num_shards)) as ex:
@@ -635,7 +626,6 @@ def load_and_cache_cluster_mmap(cluster_id, cluster_embedding_path, cluster_gene
 
             threading.Thread(target=fill_rest, daemon=True).start()
 
-        # head을 현재 결과로 사용
         return head, lookup_file_size
 
     except Exception as e:
@@ -677,6 +667,7 @@ if __name__ == "__main__":
     dynamic_thread = sys.argv[7]         # "dynamic" or else
     jaccard_calculation = sys.argv[8]    # "vector" or else
     num_thread = int(sys.argv[9])
+    prefetch_granuality = sys.argv[10] if len(sys.argv) > 10 else "fg"  # "fg" or "balance"
 
     if dataset_name == "hotpotqa":
         topic_name = dataset_name
@@ -688,7 +679,7 @@ if __name__ == "__main__":
 
     result_dir = pathlib.Path(__file__).parent.absolute().joinpath(
         "europar_results", dataset_name, "prefetch",
-        f"{cluster_size}", f"{float_value}", f"{linkage_value}", f"{dynamic_thread}", f"{jaccard_calculation}"
+        f"{cluster_size}", f"{float_value}", f"{linkage_value}", f"{dynamic_thread}", f"{jaccard_calculation}", f"{prefetch_granuality}"
     )
     result_filename = f"{timestamp}_nlist_{nlist_s}_cache_{cache_size_s}_thread_{num_thread}.csv"
 
@@ -705,7 +696,7 @@ if __name__ == "__main__":
         kafka_search(
             topic_name, faiss_inf_centroids_path, cluster_embedding_path, result_path,
             float_value, nlist_s, cache_size_s, linkage_value,
-            dynamic_thread, jaccard_calculation, num_thread
+            dynamic_thread, jaccard_calculation, num_thread, prefetch_granuality=prefetch_granuality
         )
     except Exception as e:
         exc_type, exc_obj, exc_tb = sys.exc_info()

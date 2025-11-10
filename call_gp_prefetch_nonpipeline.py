@@ -158,10 +158,7 @@ class EdgeRAGWithCache:
                         converted_cluster_id,
                         self.cluster_embedding_path,
                         self.cluster_generation_latency,
-                        self.cache,
-                        max_threads=1,
-                        min_shard_size=512,
-                        max_shard_size=2048
+                        self.cache
                     )
                 except Exception as e:
                     print(f"[Prefetch Error] Cluster {cluster_id} failed: {e}")
